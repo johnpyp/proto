@@ -2,19 +2,17 @@ use crate::error::ProtoError;
 use crate::proto::ProtoEnvironment;
 use crate::tool::Tool;
 use crate::tools_config::{ToolsConfig, SCHEMA_PLUGIN_KEY};
-use crate::user_config::UserConfig;
 use extism::{manifest::Wasm, Manifest};
 use miette::IntoDiagnostic;
 use proto_pdk_api::{HostArch, HostEnvironment, HostOS, UserConfigSettings};
 use starbase_utils::{json, toml};
 use std::{env, path::Path};
 use tracing::{debug, trace};
-use warpgate::{create_http_client_with_options, to_virtual_path, Id, PluginLocator};
+use warpgate::{to_virtual_path, Id, PluginLocator};
 
 pub fn inject_default_manifest_config(
     id: &Id,
     proto: &ProtoEnvironment,
-    user_config: &UserConfig,
     manifest: &mut Manifest,
 ) -> miette::Result<()> {
     trace!(id = id.as_str(), "Storing tool identifier");
@@ -23,6 +21,7 @@ pub fn inject_default_manifest_config(
         .config
         .insert("proto_tool_id".to_string(), id.to_string());
 
+    let user_config = proto.load_user_config()?;
     let value = json::to_string(&UserConfigSettings {
         auto_clean: user_config.auto_clean,
         auto_install: user_config.auto_install,
@@ -58,7 +57,6 @@ pub fn inject_default_manifest_config(
 pub fn locate_tool(
     id: &Id,
     proto: &ProtoEnvironment,
-    user_config: &UserConfig,
     current_dir_only: bool,
 ) -> miette::Result<PluginLocator> {
     let mut locator = None;
@@ -92,7 +90,7 @@ pub fn locate_tool(
 
     // Then check the user's config
     if locator.is_none() {
-        if let Some(maybe_locator) = user_config.plugins.get(id) {
+        if let Some(maybe_locator) = proto.load_user_config()?.plugins.get(id) {
             locator = Some(maybe_locator.to_owned());
         }
     }
@@ -117,16 +115,15 @@ pub async fn load_tool_from_locator(
     id: impl AsRef<Id>,
     proto: impl AsRef<ProtoEnvironment>,
     locator: impl AsRef<PluginLocator>,
-    user_config: &UserConfig,
 ) -> miette::Result<Tool> {
     let id = id.as_ref();
     let proto = proto.as_ref();
     let locator = locator.as_ref();
 
-    let http_client = create_http_client_with_options(user_config.http.clone())?;
+    let http_client = proto.get_http_client()?;
     let plugin_loader = proto.get_plugin_loader();
     let plugin_path = plugin_loader
-        .load_plugin_with_client(&id, locator, &http_client)
+        .load_plugin_with_client(id, locator, http_client)
         .await?;
 
     // If a TOML plugin, we need to load the WASM plugin for it,
@@ -139,13 +136,13 @@ pub async fn load_tool_from_locator(
         debug!(source = ?plugin_path, "Loading TOML plugin");
 
         let schema_id = Id::raw(SCHEMA_PLUGIN_KEY);
-        let schema_locator = locate_tool(&schema_id, proto, user_config, true)?;
+        let schema_locator = locate_tool(&schema_id, proto, true)?;
 
         let mut manifest = Tool::create_plugin_manifest(
             proto,
             Wasm::file(
                 plugin_loader
-                    .load_plugin_with_client(schema_id, schema_locator, &http_client)
+                    .load_plugin_with_client(schema_id, schema_locator, http_client)
                     .await?,
             ),
         )?;
@@ -166,7 +163,7 @@ pub async fn load_tool_from_locator(
         Tool::create_plugin_manifest(proto, Wasm::file(plugin_path))?
     };
 
-    inject_default_manifest_config(id, proto, user_config, &mut manifest)?;
+    inject_default_manifest_config(id, proto, &mut manifest)?;
 
     let mut tool = Tool::load_from_manifest(id, proto, manifest)?;
     tool.locator = Some(locator.to_owned());
@@ -176,8 +173,7 @@ pub async fn load_tool_from_locator(
 
 pub async fn load_tool(id: &Id) -> miette::Result<Tool> {
     let proto = ProtoEnvironment::new()?;
-    let user_config = proto.load_user_config()?;
-    let locator = locate_tool(id, &proto, &user_config, false)?;
+    let locator = locate_tool(id, &proto, false)?;
 
-    load_tool_from_locator(id, proto, locator, &user_config).await
+    load_tool_from_locator(id, proto, locator).await
 }
